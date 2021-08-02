@@ -1,0 +1,158 @@
+From a43524c1b3558eb8f470b8edbd352150cb7b7ca3 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Mon, 2 Aug 2021 14:45:40 -0400
+Subject: [PATCH] add support for carlitoxxpro
+
+---
+ .../90204-add-support-for-carlitoxxpro.patch  | 139 ++++++++++++++++++
+ 1 file changed, 139 insertions(+)
+ create mode 100755 target/linux/mvebu/patches-4.14/90204-add-support-for-carlitoxxpro.patch
+
+diff --git a/target/linux/mvebu/patches-4.14/90204-add-support-for-carlitoxxpro.patch b/target/linux/mvebu/patches-4.14/90204-add-support-for-carlitoxxpro.patch
+new file mode 100755
+index 0000000000..a4466ff4b0
+--- /dev/null
++++ b/target/linux/mvebu/patches-4.14/90204-add-support-for-carlitoxxpro.patch
+@@ -0,0 +1,139 @@
++From 8b959ae34997e5d1fe849299b6a1a57774089533 Mon Sep 17 00:00:00 2001
++From: Your Name <you@example.com>
++Date: Wed, 30 Jun 2021 06:33:38 -0400
++Subject: [PATCH] add support for carlitoxxpro
++
++---
++ drivers/net/phy/sfp.c | 74 +++++++++++++++++++++++++++++++++++++++++--
++ 1 file changed, 72 insertions(+), 2 deletions(-)
++
++diff --git a/drivers/net/phy/sfp.c b/drivers/net/phy/sfp.c
++index b6aa066..49e31a3 100644
++--- a/drivers/net/phy/sfp.c
+++++ b/drivers/net/phy/sfp.c
++@@ -114,6 +114,7 @@ struct sfp {
++ 	struct mii_bus *i2c_mii;
++ 	struct sfp_bus *sfp_bus;
++ 	struct phy_device *mod_phy;
+++	size_t i2c_block_size;
++ 
++ 	unsigned int (*get_state)(struct sfp *);
++ 	void (*set_state)(struct sfp *, unsigned int);
++@@ -180,6 +181,7 @@ static int sfp_i2c_read(struct sfp *sfp, bool a2, u8 dev_addr,
++ {
++ 	struct i2c_msg msgs[2];
++ 	u8 bus_addr = a2 ? 0x51 : 0x50;
+++	size_t block_size = sfp->i2c_block_size;
++ 	size_t this_len;
++ 	int ret;
++ 
++@@ -194,8 +196,8 @@ static int sfp_i2c_read(struct sfp *sfp, bool a2, u8 dev_addr,
++ 
++ 	while (len) {
++ 		this_len = len;
++-		if (this_len > 16)
++-			this_len = 16;
+++		if (this_len > block_size)
+++			this_len = block_size;
++ 
++ 		msgs[1].len = this_len;
++ 
++@@ -669,6 +671,32 @@ static int sfp_rollball_init_mdio(struct sfp *sfp)
++ 	return 0;
++ }
++ 
+++/* GPON modules based on Realtek RTL8672 and RTL9601C chips (e.g. V-SOL
+++ * V2801F, CarlitoxxPro CPGOS03-0490, Ubiquiti U-Fiber Instant, ...) do
+++ * not support multibyte reads from the EEPROM. Each multi-byte read
+++ * operation returns just one byte of EEPROM followed by zeros. There is
+++ * no way to identify which modules are using Realtek RTL8672 and RTL9601C
+++ * chips. Moreover every OEM of V-SOL V2801F module puts its own vendor
+++ * name and vendor id into EEPROM, so there is even no way to detect if
+++ * module is V-SOL V2801F. Therefore check for those zeros in the read
+++ * data and then based on check switch to reading EEPROM to one byte
+++ * at a time.
+++ */
+++static bool sfp_id_needs_byte_io(struct sfp *sfp, void *buf, size_t len)
+++{
+++	size_t i, block_size = sfp->i2c_block_size;
+++
+++	/* Already using byte IO */
+++	if (block_size == 1)
+++		return false;
+++
+++	for (i = 1; i < len; i += block_size) {
+++		if (memchr_inv(buf + i, '\0', min(block_size - 1, len - i)))
+++			return false;
+++	}
+++	return true;
+++}
+++
++ static int sfp_sm_mod_probe(struct sfp *sfp)
++ {
++ 	/* SFP module inserted - read I2C data */
++@@ -683,6 +711,12 @@ static int sfp_sm_mod_probe(struct sfp *sfp)
++ 	u8 check;
++ 	int err;
++ 
+++	/* Some SFP modules and also some Linux I2C drivers do not like reads
+++	 * longer than 16 bytes, so read the EEPROM in chunks of 16 bytes at
+++	 * a time.
+++	 */
+++	sfp->i2c_block_size = 16;
+++
++ 	err = sfp_read(sfp, false, 0, &id, sizeof(id));
++ 	if (err < 0) {
++ 		dev_err(sfp->dev, "failed to read EEPROM: %d\n", err);
++@@ -694,6 +728,31 @@ static int sfp_sm_mod_probe(struct sfp *sfp)
++ 		return -EAGAIN;
++ 	}
++ 
+++	/* Some SFP modules (e.g. Nokia 3FE46541AA) lock up if read from
+++	 * address 0x51 is just one byte at a time. Also SFF-8472 requires
+++	 * that EEPROM supports atomic 16bit read operation for diagnostic
+++	 * fields, so do not switch to one byte reading at a time unless it
+++	 * is really required and we have no other option.
+++	 */
+++	if (sfp_id_needs_byte_io(sfp, &id.base, sizeof(id.base))) {
+++		dev_info(sfp->dev,
+++			 "Detected broken RTL8672/RTL9601C emulated EEPROM\n");
+++		dev_info(sfp->dev,
+++			 "Switching to reading EEPROM to one byte at a time\n");
+++		sfp->i2c_block_size = 1;
+++
+++		err = sfp_read(sfp, false, 0, &id.base, sizeof(id.base));
+++		if (err < 0) {
+++            dev_err(sfp->dev, "failed to read EEPROM: %d\n", err);
+++			return -EAGAIN;
+++		}
+++
+++		if (err != sizeof(id.base)) {
+++			dev_err(sfp->dev, "EEPROM short read: %d\n", err);
+++			return -EAGAIN;
+++		}
+++	}
+++
++ 	/* Validate the checksum over the base structure */
++ 	check = sfp_check(&id.base, sizeof(id.base) - 1);
++ 	if (check != id.base.cc_base) {
++@@ -705,6 +764,17 @@ static int sfp_sm_mod_probe(struct sfp *sfp)
++ 		return -EINVAL;
++ 	}
++ 
+++	err = sfp_read(sfp, false, SFP_CC_BASE + 1, &id.ext, sizeof(id.ext));
+++	if (err < 0) {
+++        dev_err(sfp->dev, "failed to read EEPROM: %d\n", err);
+++		return -EAGAIN;
+++	}
+++
+++	if (err != sizeof(id.ext)) {
+++		dev_err(sfp->dev, "EEPROM short read: %d\n", err);
+++		return -EAGAIN;
+++	}
+++
++ 	check = sfp_check(&id.ext, sizeof(id.ext) - 1);
++ 	if (check != id.ext.cc_ext) {
++ 		dev_err(sfp->dev,
++-- 
++2.27.0
++
+-- 
+2.27.0
+
